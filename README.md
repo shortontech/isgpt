@@ -1,6 +1,6 @@
-# isgpt Pure Go Server
+# isgpt - AI Text Detection
 
-This is a pure Go implementation of the isgpt AI detection server using ONNX Runtime. **No Python runtime required!**
+AI-generated text detection system using perplexity analysis with GPT-2. Built with Go and ONNX Runtime for efficient CPU-based inference.
 
 ## Features
 
