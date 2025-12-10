@@ -1,0 +1,5 @@
+venv/
+models/
+*.pyc
+test_text.md
+cli/isgpt-cli

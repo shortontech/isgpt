@@ -1,0 +1,42 @@
+version: '3.8'
+
+volumes:
+  isgpt-models:
+
+services:
+  # One-time service to export ONNX model to volume
+  model-export:
+    image: huggingface/transformers-pytorch-cpu:latest
+    volumes:
+      - isgpt-models:/models
+      - ./export_onnx.py:/app/export_onnx.py:ro
+    working_dir: /app
+    command: >
+      bash -c "
+        python3 export_onnx.py &&
+        cp -r models/* /models/ &&
+        echo 'Model export complete! Files in volume:' &&
+        ls -lh /models/
+      "
+    profiles:
+      - setup
+
+  isgpt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9081:9081"
+    volumes:
+      - isgpt-models:/app/models:ro
+    environment:
+      - PORT=9081
+      - HOST=0.0.0.0
+      - MODEL_PATH=/app/models/model.onnx
+      - TOKENIZER_PATH=/app/models/tokenizer.json
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
