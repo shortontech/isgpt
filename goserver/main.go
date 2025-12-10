@@ -23,6 +23,8 @@ type GPT2Model struct {
 	mu        sync.Mutex
 }
 
+const minTokensPerChunk = 20 // Minimum tokens for reliable perplexity estimation
+
 type InferenceRequest struct {
 	Sentence string `json:"sentence"`
 	Detailed bool   `json:"detailed"`
@@ -91,6 +93,68 @@ func (m *GPT2Model) Close() {
 	ort.DestroyEnvironment()
 }
 
+// Count tokens in a text
+func (m *GPT2Model) countTokens(text string) int {
+	ids, _ := m.tokenizer.Encode(text, false)
+	return len(ids)
+}
+
+// Chunk sentences to meet minimum token threshold
+type sentenceChunk struct {
+	sentences []string
+	text      string
+}
+
+func (m *GPT2Model) chunkSentences(sentences []string) []sentenceChunk {
+	var chunks []sentenceChunk
+	var currentChunk []string
+	var currentText string
+	currentTokens := 0
+
+	for _, sentence := range sentences {
+		if sentence == "" {
+			continue
+		}
+
+		sentenceTokens := m.countTokens(sentence)
+
+		// If adding this sentence would still be under threshold, add it to current chunk
+		if currentTokens > 0 && currentTokens+sentenceTokens < minTokensPerChunk {
+			currentChunk = append(currentChunk, sentence)
+			if currentText == "" {
+				currentText = sentence
+			} else {
+				currentText = currentText + " " + sentence
+			}
+			currentTokens += sentenceTokens
+		} else if currentTokens > 0 {
+			// Current chunk meets threshold, save it and start new chunk
+			chunks = append(chunks, sentenceChunk{
+				sentences: currentChunk,
+				text:      currentText,
+			})
+			currentChunk = []string{sentence}
+			currentText = sentence
+			currentTokens = sentenceTokens
+		} else {
+			// First sentence in chunk
+			currentChunk = []string{sentence}
+			currentText = sentence
+			currentTokens = sentenceTokens
+		}
+	}
+
+	// Add final chunk if not empty
+	if len(currentChunk) > 0 {
+		chunks = append(chunks, sentenceChunk{
+			sentences: currentChunk,
+			text:      currentText,
+		})
+	}
+
+	return chunks
+}
+
 // Calculate perplexity for a given text
 func (m *GPT2Model) getPPL(text string) (float64, error) {
 	// Tokenize the input - Encode returns (ids []uint32, tokens []string)
@@ -124,7 +188,6 @@ func (m *GPT2Model) getPPL(text string) (float64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("failed to create input tensor: %w", err)
 		}
-		defer inputTensor.Destroy()
 
 		// Create position_ids tensor (sequential indices)
 		positionData := make([]int64, len(inputIds))
@@ -133,9 +196,9 @@ func (m *GPT2Model) getPPL(text string) (float64, error) {
 		}
 		positionTensor, err := ort.NewTensor(inputShape, positionData)
 		if err != nil {
+			inputTensor.Destroy()
 			return 0, fmt.Errorf("failed to create position tensor: %w", err)
 		}
-		defer positionTensor.Destroy()
 
 		// Prepare output tensor
 		// GPT2 output shape: [batch_size, sequence_length, vocab_size]
@@ -143,13 +206,20 @@ func (m *GPT2Model) getPPL(text string) (float64, error) {
 		outputShape := ort.NewShape(1, int64(len(inputIds)), int64(vocabSize))
 		outputTensor, err := ort.NewEmptyTensor[float32](outputShape)
 		if err != nil {
+			inputTensor.Destroy()
+			positionTensor.Destroy()
 			return 0, fmt.Errorf("failed to create output tensor: %w", err)
 		}
-		defer outputTensor.Destroy()
 
 		// Run inference with both input_ids and position_ids
+		// Lock mutex only for the actual inference call
+		m.mu.Lock()
 		err = m.session.Run([]ort.Value{inputTensor, positionTensor}, []ort.Value{outputTensor})
+		m.mu.Unlock()
 		if err != nil {
+			inputTensor.Destroy()
+			positionTensor.Destroy()
+			outputTensor.Destroy()
 			return 0, fmt.Errorf("inference failed: %w", err)
 		}
 
@@ -175,6 +245,11 @@ func (m *GPT2Model) getPPL(text string) (float64, error) {
 
 		nll := m.calculateNLL(logits, targetIds, vocabSize, startIdx, len(targetIds))
 		nlls = append(nlls, nll)
+
+		// Explicitly destroy tensors at end of iteration
+		inputTensor.Destroy()
+		positionTensor.Destroy()
+		outputTensor.Destroy()
 
 		prevEndLoc = endLoc
 		if endLoc == seqLen {
@@ -276,9 +351,6 @@ func getResults(threshold float64) (string, int, float64) {
 }
 
 func (m *GPT2Model) Infer(sentence string, detailed bool) (*InferenceResponse, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	response := &InferenceResponse{}
 
 	// Check minimum text length
@@ -313,32 +385,34 @@ func (m *GPT2Model) Infer(sentence string, detailed bool) (*InferenceResponse, e
 		}
 	}
 
-	// Calculate per-line perplexity
+	// Chunk sentences to meet minimum token threshold for reliable perplexity
+	chunks := m.chunkSentences(validLines)
+
+	// Calculate per-chunk perplexity
 	var perplexityPerLine []float64
 	var sentenceDetails []SentenceDetail
 
-	for _, line := range validLines {
-		if line == "" {
-			continue
-		}
-
-		linePPL, err := m.getPPL(line)
+	for _, chunk := range chunks {
+		chunkPPL, err := m.getPPL(chunk.text)
 		if err != nil {
-			log.Printf("Warning: failed to calculate PPL for line: %v", err)
+			log.Printf("Warning: failed to calculate PPL for chunk: %v", err)
 			continue
 		}
 
-		perplexityPerLine = append(perplexityPerLine, linePPL)
+		perplexityPerLine = append(perplexityPerLine, chunkPPL)
 
+		// If detailed, assign the chunk's perplexity to all sentences in the chunk
 		if detailed {
-			message, label, confidence := getResults(linePPL)
-			sentenceDetails = append(sentenceDetails, SentenceDetail{
-				Text:           line,
-				Perplexity:     linePPL,
-				Label:          label,
-				Classification: message,
-				Confidence:     confidence,
-			})
+			message, label, confidence := getResults(chunkPPL)
+			for _, sentence := range chunk.sentences {
+				sentenceDetails = append(sentenceDetails, SentenceDetail{
+					Text:           sentence,
+					Perplexity:     chunkPPL,
+					Label:          label,
+					Classification: message,
+					Confidence:     confidence,
+				})
+			}
 		}
 	}
 
