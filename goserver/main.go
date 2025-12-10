@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/daulet/tokenizers"
 	ort "github.com/yalue/onnxruntime_go"
@@ -19,6 +20,7 @@ type GPT2Model struct {
 	tokenizer *tokenizers.Tokenizer
 	maxLength int
 	stride    int
+	mu        sync.Mutex
 }
 
 type InferenceRequest struct {
@@ -274,6 +276,9 @@ func getResults(threshold float64) (string, int, float64) {
 }
 
 func (m *GPT2Model) Infer(sentence string, detailed bool) (*InferenceResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	response := &InferenceResponse{}
 
 	// Check minimum text length
